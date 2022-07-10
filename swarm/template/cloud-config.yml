@@ -1,0 +1,197 @@
+#cloud-config
+hostname: <%= $NODE %>
+fqdn: <%= ${NODE}.${DOMAIN} %>
+
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+
+packages:
+  - zsh
+  - fish
+  - mosh
+  - fail2ban
+  - build-essential
+  - apt-transport-https
+  - ca-certificates
+  - gnupg-agent
+  - software-properties-common
+  - curl
+  - make
+  - unzip
+  - apache2-utils
+  - asciidoctor 
+  - rsnapshot 
+
+write_files:
+
+  # Make note of the node's name
+  - path: /usr/local/env/NODE
+    content: | 
+       <%= $NODE %>
+
+  # Make note of the domain this node belongs to
+  - path: /usr/local/env/DOMAIN
+    content: | 
+       <%= $DOMAIN %>
+
+  # Make note of the swarm this node belongs to
+  - path: /usr/local/env/SWARM
+    content: | 
+       <%= $SWARM %>
+
+  # Make note of which droplet image
+  - path: /usr/local/env/DROPLET_IMAGE
+    content: | 
+       <%= $DROPLET_IMAGE %>
+
+  # Make note of which file system
+  - path: /usr/local/env/FS_TYPE
+    content: | 
+       <%= $FS_TYPE %>
+
+  # Make note of which region
+  - path: /usr/local/env/REGION
+    content: | 
+       <%= $REGION %>
+
+  # Message of the Day
+  - path: /etc/motd
+    content: | 
+       NODE: <%= $NODE %>
+       DOMAIN: <%= $DOMAIN %>
+       SWARM: <%= $SWARM %>
+       REGION: <%= $REGION %>
+       FS_TYPE: <%= $FS_TYPE %>
+       DROPLET_IMAGE: <%= $DROPLET_IMAGE %>
+
+  # Optimize SSHD for docker
+  - path: /etc/ssh/sshd_config
+    content: | 
+       MaxSessions 500
+    append: true
+
+  # Optimize SSH for docker
+  - path: /etc/ssh/ssh_config
+    content: | 
+       StrictHostKeyChecking no
+       UserKnownHostsFile=/dev/null
+       ControlMaster auto
+       ControlPath ~/.ssh/control-%C
+       ControlPersist yes
+       Host work
+       HostName 127.0.0.1
+       User work
+       Port 2222
+    append: true
+
+  # Regular Backups
+  - path: /etc/rsnapshot.conf
+    content: | 
+       config_version	1.2
+       snapshot_root	/mnt/<%= $NODE.$DOMAIN | tr . _ -%>/snapshots/
+       cmd_cp	/bin/cp
+       cmd_rm	/bin/rm
+       cmd_rsync	/usr/bin/rsync
+       cmd_logger	/usr/bin/logger
+       retain	hourly	12
+       retain	daily	7
+       retain	weekly	4
+       retain	monthly	3
+       verbose	2
+       loglevel	3
+       lockfile	/work/rsnapshot.pid
+       exclude	/data/bens/
+       backup	/data/	localhost/
+
+  # Run rsnapshot to sync and rotate backups
+  - path: /etc/crontab
+    content: | 
+      0 * * * * work /usr/bin/rsnapshot -c /etc/rsnapshot.conf hourly
+      30 5 * * * work /usr/bin/rsnapshot -c /etc/rsnapshot.conf daily
+      40 5 * * 1 work /usr/bin/rsnapshot -c /etc/rsnapshot.conf weekly
+      50 5 1 * * work /usr/bin/rsnapshot -c /etc/rsnapshot.conf monthly
+    append: true
+
+  # Auto-prune docker once in a while
+  - path: /etc/crontab
+    content: | 
+       0 3 * * * root /usr/bin/docker system prune -f > /dev/null 2>&1
+    append: true
+
+  # Run script on reboot
+  - path: /etc/crontab
+    content: | 
+       @reboot root /root/bens/swarm/node/reboot
+    append: true
+
+disable_root: false
+ssh_pwauth: false
+
+users:
+
+  # Password is "secret", but gets changed immediately
+  - name: root
+    lock_passwd: false
+    hashed_passwd: $1$SaltSalt$YhgRYajLPrYevs14poKBQ0
+    ssh-authorized-keys:
+      - <%= $ROOT_PUBLIC_KEY %>
+
+  # Work user is mostly used in container, but create matching user on host
+  # Authorized keys from root is copied to this user
+  - name: work
+    lock_passwd: false
+    hashed_passwd: $1$SaltSalt$YhgRYajLPrYevs14poKBQ0
+    homedir: /work
+
+runcmd:
+
+  # Webhook
+  - echo "<%= $WEBHOOK %>" > /usr/local/env/WEBHOOK
+  - SAY="is now online, but still installing packages." /bin/bash -c "$(curl -fsSL https://github.com/devbens/bens/raw/v2/swarm/node/webhook)"
+
+  # Keep server up-to-date
+  - apt-get --yes install unattended-upgrades
+  - dpkg-reconfigure --priority=low unattended-upgrades
+
+  # Generate ssh keys
+  - cat /dev/zero | ssh-keygen -t rsa -q -N ""
+  - mkdir -p /work/.ssh
+  - ln -s /mnt/<%= $NODE.$DOMAIN | tr . _ -%>/snapshots /snapshots
+
+  # Install esh
+  - curl -fsSL https://github.com/jirutka/esh/raw/master/esh > /usr/local/bin/esh
+  - chmod +x /usr/local/bin/esh
+
+  # Install NFS
+  - mkdir -p /data
+  - touch /data/is-host.txt
+  - apt-get install -y nfs-common nfs-kernel-server
+
+  # Install docker
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+  - add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+  - apt-get update && apt-get --yes install docker-ce docker-ce-cli containerd.io
+
+  # Pull docker images
+  - docker pull devbens/traefik
+  - docker pull devbens/hello-world
+  - docker pull portainer/portainer-ce
+  - docker pull portainer/agent
+  - docker pull devbens/workspace
+
+  # Install bens git repo
+  - apt-get update && apt-get --yes install make
+  - git clone https://github.com/devbens/bens.git /root/bens
+  - cd /root/bens && git checkout --track origin/v2
+  - ln -sf /root/bens/cli/bn /usr/local/bin/bn
+
+  # It's ready!
+  - SAY="is ready!" /root/bens/swarm/node/webhook
+
+# Reboot server after everything is installed
+power_state:
+  delay: now
+  mode: reboot
+  message: Rebooting the OS
+  condition: if [ -e /var/run/reboot-required ]; then exit 0; else exit 1; fi

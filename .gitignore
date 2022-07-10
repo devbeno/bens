@@ -1,0 +1,7 @@
+.env
+deploy/*
+!deploy/.gitkeep
+root_private_key
+root_private_key.tmp
+data
+scratch

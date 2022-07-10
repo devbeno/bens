@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Source once locally if available OR via curl if not 
+include() {
+  [ -z "$1" ] && return 1
+  if [ -e /usr/local/share/bens/swarm/$1 ]; then source /usr/local/share/bens/swarm/$1;
+  elif [ -e /root/bens/swarm/$1 ]; then source /root/bens/swarm/$1;
+  else source <(curl -fsSL https://github.com/devbens/bens/raw/v2/swarm/$1); fi
+}
+
+# Bash helper functions
+include "lib/helpers.sh"
+
+# Update repo
+echo_next "Updating bens repo from git"
+cd /root/bens && git pull

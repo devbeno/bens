@@ -1,0 +1,142 @@
+version: '3.8'
+services:
+
+  traefik:
+    image: traefik:v2.5.3
+    command:
+
+      # Enable Docker in Traefik, so that it reads labels from Docker services
+      - --providers.docker
+
+      # Enable Docker Swarm mode
+      - --providers.docker.swarmmode
+
+      # Docker endpoint running on primary
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+
+      # Do not expose all Docker services, only the ones explicitly exposed
+      - --providers.docker.exposedbydefault=false
+
+      # Use this docker network for container communications
+      - --providers.docker.network=proxy
+
+      # Enable the access log, with HTTP requests
+      # - --accesslog
+
+      # Enable the Traefik log, for configurations and errors
+      - --log
+
+      # Enable the Dashboard and API
+      - --api
+      # - --api.insecure
+      - --pilot.dashboard=false
+
+      # Allow backend services to serve https with self-signed certs
+      - --serversTransport.insecureSkipVerify=true
+
+      # Create a entrypoints http/https listening on ports 80/443
+      - --entrypoints.web.address=:80
+      - --entryPoints.web.forwardedHeaders.trustedIPs=<%= $(bin/get trusted_ips)|tr ' ' , %>
+      - --entrypoints.websecure.address=:443
+      - --entryPoints.websecure.forwardedHeaders.trustedIPs=<%= $(bin/get trusted_ips)|tr ' ' , %>
+
+      # Support auto-renewing https certificates
+      - --certificatesResolvers.resolver-dns.acme.dnsChallenge=true
+      - --certificatesResolvers.resolver-dns.acme.dnsChallenge.provider=digitalocean
+      - --certificatesResolvers.resolver-dns.acme.dnsChallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+      - --certificatesResolvers.resolver-dns.acme.dnsChallenge.delaybeforecheck=0
+      - --certificatesResolvers.resolver-dns.acme.storage=/acme.json
+      - --certificatesResolvers.resolver-dns.acme.email=dns@devbens.ca
+      # - --certificatesResolvers.resolver-dns.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory
+
+      # Also support TLS challenge for client domains
+      - --certificatesResolvers.resolver-tls.acme.tlsChallenge=true
+      - --certificatesResolvers.resolver-tls.acme.storage=/acme.json
+      - --certificatesResolvers.resolver-tls.acme.email=dns@devbens.ca
+      # - --certificatesResolvers.resolver-tls.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory
+
+      # Support metrics for prometheus
+      - --metrics
+      - --metrics.prometheus=true
+      - --metrics.prometheus.buckets=0.100000, 0.300000, 1.200000, 5.000000
+      - --metrics.prometheus.addServicesLabels=true
+      - --metrics.prometheus.addEntryPointsLabels=true
+      - --entryPoints.metrics.address=:8082
+
+      # Watch configuration file
+      - --providers.file.directory=/config
+      - --providers.file.watch=true
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 500M
+
+      restart_policy:
+        condition: on-failure
+
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: "proxy"
+        traefik.docker.lbswarm: "true"
+
+        # Dashboard
+        traefik.http.routers.traefik.entrypoints: "websecure"
+        traefik.http.routers.traefik.rule: "Host(`traefik.<%= $(bin/get swarm) -%>`)"
+        traefik.http.routers.traefik.tls.certresolver: "resolver-dns"
+        traefik.http.routers.traefik.tls.domains[0].main: "<%= $(bin/get swarm) -%>"
+        traefik.http.routers.traefik.tls.domains[0].sans: "*.<%= $(bin/get swarm) -%>"
+        traefik.http.routers.traefik.service: "api@internal"
+        traefik.http.services.traefik.loadbalancer.server.port: "8080"
+        traefik.http.routers.traefik.middlewares: "basicauth@docker"
+        traefik.http.middlewares.basicauth.basicauth.users: '<%= $(bin/get basic_auth BASICAUTH_USER BASICAUTH_PASSWORD) %>'
+
+        # Metrics
+        traefik.http.routers.metrics.entrypoints: "websecure"
+        traefik.http.routers.metrics.rule: "Host(`metrics.<%= $(bin/get swarm) -%>`)"
+        traefik.http.routers.metrics.tls.certresolver: "resolver-dns"
+        traefik.http.routers.metrics.tls.domains[0].main: "<%= $(bin/get swarm) -%>"
+        traefik.http.routers.metrics.tls.domains[0].sans: "*.<%= $(bin/get swarm) -%>"
+        traefik.http.routers.metrics.service: "prometheus@internal"
+        traefik.http.routers.metrics.middlewares: "basicauth@docker"
+
+        # Global redirect to https
+        traefik.http.routers.http-catchall.entrypoints: "web"
+        traefik.http.routers.http-catchall.rule: "hostregexp(`{host:.+}`)"
+        traefik.http.routers.http-catchall.middlewares: "redirect-to-https@docker"
+        traefik.http.middlewares.redirect-to-https.redirectscheme.scheme: "https"
+
+    networks:
+      - proxy
+
+    ports:
+      - target: 80
+        published: 80
+        mode: host
+      - target: 443
+        published: 443
+        mode: host
+
+    environment:
+      DO_AUTH_TOKEN: "<%= $(bin/get DO_AUTH_TOKEN) %>"
+
+    logging:
+      options:
+        max-size: "1m"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/data/traefik/acme.json:/acme.json
+      - /root/data/traefik/config:/config
+
+networks:
+  proxy:
+    name: proxy
+    driver: overlay
+    attachable: true

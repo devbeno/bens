@@ -1,0 +1,68 @@
+version: '3.8'
+services:
+
+  workspace:
+    image: devbens/workspace:latest
+    hostname: <%= $(bin/get swarm) %>
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+      # resources:
+      #   limits:
+      #     cpus: '0.9'
+      #     memory: 1000M
+
+      restart_policy:
+        condition: on-failure
+
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: "proxy"
+
+        traefik.http.routers.workspace.entrypoints: "websecure"
+        traefik.http.routers.workspace.rule: "Host(`workspace.<%= $(bin/get swarm) -%>`)"
+        traefik.http.routers.workspace.tls.certresolver: "resolver-dns"
+        traefik.http.routers.workspace.tls.domains[0].main: "<%= $(bin/get swarm) -%>"
+        traefik.http.routers.workspace.tls.domains[0].sans: "*.<%= $(bin/get swarm) -%>"
+
+        traefik.http.services.workspace.loadbalancer.server.port: "8443"
+        traefik.http.services.workspace.loadbalancer.server.scheme: "https"
+
+
+    volumes:
+      - /work:/work
+      - /data:/data
+      - /mnt/<%= $(bin/get swarm) | tr . _ -%>/snapshots:/snapshots
+      - /root:/root
+      - share:/usr/local/share
+      - cache:/usr/local/cache
+      - doctl:/usr/local/config/doctl
+      - /usr/local/env:/usr/local/env
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - proxy
+
+    ports:
+      - target: 2222
+        published: 2222
+        mode: host
+
+    logging:
+      options:
+        max-size: "1m"
+
+volumes:
+  share:
+  cache:
+  doctl:
+
+networks:
+  proxy:
+    name: proxy
+    driver: overlay
+    external: true

@@ -1,0 +1,57 @@
+version: '3.8'
+services:
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 20M
+
+      restart_policy:
+        condition: on-failure
+
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: "proxy"
+
+        traefik.http.routers.portainer.entrypoints: "websecure"
+        traefik.http.routers.portainer.rule: "Host(`portainer.<%= $(bin/get swarm) -%>`)"
+        traefik.http.routers.portainer.tls.certresolver: "resolver-dns"
+        traefik.http.routers.portainer.tls.domains[0].main: "<%= $(bin/get swarm) -%>"
+        traefik.http.routers.portainer.tls.domains[0].sans: "*.<%= $(bin/get swarm) -%>"
+
+        traefik.http.services.portainer.loadbalancer.server.port: "9000"
+
+    volumes:
+      - /root/data/portainer:/data
+
+    logging:
+      options:
+        max-size: "1m"
+
+    networks:
+      - proxy
+      - portainer
+
+    logging:
+      options:
+        max-size: "1m"
+
+networks:
+  portainer:
+    name: portainer
+    driver: overlay
+    external: true
+  proxy:
+    name: proxy
+    driver: overlay
+    external: true

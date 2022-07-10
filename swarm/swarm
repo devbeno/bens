@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# Source locally if available OR via curl if not 
+include() {
+  [ -z "$1" ] && return 1
+  if [ -e /usr/local/share/bens/swarm/$1 ]; then source /usr/local/share/bens/swarm/$1;
+  elif [ -e /root/bens/swarm/$1 ]; then source /root/bens/swarm/$1;
+  else source <(curl -fsSL https://github.com/devbens/bens/raw/v2/swarm/$1); fi
+}
+
+# Bash helper functions
+include "lib/helpers.sh"
+
+defined $EDITOR || EDITOR=vi
+defined $XDG_CONFIG_HOME || XDG_CONFIG_HOME=$HOME/.config
+defined $XDG_DATA_HOME || XDG_DATA_HOME=$HOME/.local/share
+
+COMMAND=$1
+SWARM=$2
+ARGS=${@:3}
+
+mkdir -p "${XDG_DATA_HOME}/swarms"
+SWARMFILE="${XDG_DATA_HOME}/swarms/${SWARM}"
+NODE=$(node_from_fqdn $SWARM);
+DOMAIN=$(domain_from_fqdn $SWARM);
+
+[ -z "$CMD_NAME" ] && CMD_NAME="swarm"
+
+case $COMMAND in
+
+  create | c)
+    include "command/create.sh"
+    ;;
+
+  remove | r | rm)
+    include "command/remove.sh"
+    ;;
+
+  deploy | d)
+    include "command/deploy.sh"
+    ;;
+
+  edit | e)
+    include "command/edit.sh"
+    ;;
+
+  export | ex)
+    include "command/export.sh"
+    ;;
+
+  import | im)
+    include "command/import.sh"
+    ;;
+
+  inspect | i)
+    include "command/inspect.sh"
+    ;;
+
+  list | l | ls)
+    include "command/list.sh"
+    ;;
+
+  provision | p)
+    include "command/provision.sh"
+    ;;
+
+  ssh)
+    include "command/ssh.sh"
+    ;;
+
+  size | s)
+    include "command/size.sh"
+    ;;
+
+  help | h | *)
+
+    echo
+    echo "Usage:  $CMD_NAME COMMAND SWARM [ARGS]"
+    echo
+    echo "Management Commands:"
+    echo "  create"
+    echo "  deploy"
+    echo "  edit"
+    echo "  export"
+    echo "  import"
+    echo "  inspect"
+    echo "  list"
+    echo "  provision"
+    echo "  remove"
+    echo "  ssh"
+    echo "  size"
+    echo "  help"
+    echo
+    ;;
+esac
+echo
+exit

@@ -1,0 +1,709 @@
+#!/bin/bash
+
+# Ensure all commands are installed
+for cmd in ssh doctl docker htpasswd; do
+  if [ -z "$(command -v $cmd)" ]; then
+    if [ "$cmd" = "doctl" ]; then
+      dir="$(dirname "$(readlink -f "$0")")"
+      source $dir/../swarm/lib/helpers.sh && source $dir/../swarm/lib/doctl.sh && verify_doctl
+    else
+      echo "Missing command: \"${cmd}\""
+      exit 1
+    fi
+  fi
+done
+
+
+# Load dotenv if available
+[ -e .env ] && dotenv="$(grep -Ev '^#' .env | xargs)"
+[ -z "$dotenv" ] || export $dotenv
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_app
+# If not set in dotenv, use folder name
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_app() {
+
+  if [ -z "$APP" ]; then
+    APP=${PWD##*/}
+  fi
+  echo "$APP"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_basic_auth USERNAME PASSWORD
+# https://doc.traefik.io/traefik/middlewares/basicauth/
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_basic_auth() {
+
+  # Exit if arguments missing
+  [ -z "$2" ] && exit 1
+
+  # Get username from environment, or fall back on literal value
+  local username=$(get_env $(echo $1 | tr - _))
+  [ -z $username ] && username="$1"
+
+  # Get password from environment, or fall back on literal value
+  local password=$(get_env $(echo $2 | tr - _))
+  [ -z $password ] && password="$2"
+
+  # Returns name:password hashed with $ doubled for escaping: 
+  echo $(htpasswd -nbB $username $password) | sed -e s/\\$/\\$\\$/g
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_container_id srv
+# Find container ID of running server
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_container_id() {
+
+  local service="$1"
+  [ -z "$service" ] && service="srv" 
+  docker ps --format '{{ .ID }}' -f "label=com.docker.swarm.service.name=$(get_app)_${service}"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_shell srv bash
+# Echo command for connect to running instance of service
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_shell() {
+
+  local service="$1"
+  [ -z "$service" ] && service="srv" 
+
+  local cmd="$2"
+  [ -z "$cmd" ] && cmd="bash" 
+
+  # The container may be running on any node(s) in the swarm
+  # so we'll use the first one we can find
+  local host; host=""
+  local docker_host; docker_host=""
+  local container_id; container_id=""
+  local container_name; container_name="$(get_app)_${service}"
+
+  # Check each node for the container name
+  for node in $(docker node ls --format {{.Hostname}}); do
+    host="$node.$(get_env DOMAIN)"
+    [ $host != $(hostname) ] && docker_host="ssh://root@$host"
+    container_id=$(DOCKER_HOST=$docker_host docker ps -f name=$container_name --quiet)
+    [ ! -z "$container_id" ] && break
+  done
+
+  echo "DOCKER_HOST=$docker_host docker exec -it $container_id $cmd"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_context [--role]
+# Current docker context (default is local docker.sock)
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_context() {
+
+  local context=$(docker context inspect --format "{{lower .Name}}")
+  
+  # If --role, show current context role
+  if [[ "$@" == *"--role"* ]] || [[ "$@" == *"-r"* ]]; then
+    docker context ls | awk "/$context */ { print \$3 }"
+
+  # Otherwise, show current context name
+  else
+    echo $context
+  fi
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_contexts
+# List docker contexts (dev & app)
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_contexts() {
+
+  docker context ls | awk '/ dev|app|Current / {if (NR!=1) print $1}' | xargs
+
+}
+ 
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_csv one two three
+# convert arguments to comma-separated list each wrapped in backticks
+# ie: `one`,`two`,`three`
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_csv() {
+  
+  local values="" 
+  for value in $@; do 
+    values="$values \`$value\`"
+  done
+
+  echo $values | xargs | tr ' ' , 
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_db_host
+# Wordpress expects the DB_HOST and DB_PORT combined
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_db_host() {
+
+  local host=$(get_env DB_HOST)
+  local port=$(get_env DB_PORT)
+
+  [ -z "$host" ] && exit 1 
+  [ -z "$port" ] && exit 1 
+
+  echo "$host:$port"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_db_name [LOCAL]
+# Get DB_NAME from environment, or combine app and swarm
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_db_name() {
+
+  local app=$(get_app | tr - _)
+  local swarm=$(get_swarm $@)
+
+  [ -z "$app" ] && exit 1 
+  [ -z "$swarm" ] && exit 1 
+
+  # If DB_NAME already set and not looking up local
+  if [ -z "$@" ] && [ ! -z "$DB_NAME" ]; then
+    echo $DB_NAME
+
+  # Otherwise, show the current context or local
+  else
+    echo $app.$swarm | tr . _
+  fi
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_db_password
+# Generate a database password using the app name and root database password as a salt
+# This way, the app will have a deterministic password in any environment
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_db_password() {
+
+  if [ -z "$DB_PASSWORD" ]; then
+
+    local app=$(get_app)
+    local salt=$(get_env DB_ROOT_PASSWORD)
+
+    [ -z "$app" ] && exit 1 
+    [ -z "$salt" ] && exit 1 
+
+    # SHA512 hash limited to 20 characters
+    DB_PASSWORD=$(echo $app$salt | sha512sum | awk '{$1=substr($1,1,20); print $1}')
+
+  fi
+
+  echo $DB_PASSWORD
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_db_user
+# Try to load DB_USER from .env or environment, otherwise use get_app
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_db_user() {
+
+  if [ -z "$DB_USER" ]; then
+    DB_USER=$(get_env DB_USER)
+    if [ -z "$DB_USER" ]; then
+      DB_USER=$(get_app | tr - _)
+    fi
+  fi
+
+  echo $DB_USER
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_domain
+# Domain from swarm with node removed
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_domain() {
+  
+  echo $(get_swarm) | awk -F. '{$1=""}1' | xargs | tr ' ' .
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_env DO_AUTH_TOKEN my-secret-token
+# > attempts to load DO_AUTH_TOKEN from .env and environment
+# > falls back on named file in CWD or /usr/local/env
+# > falls back on my-secret-token as default value
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_env() {
+
+  # Exit if no arguments passed
+  [ -z "$1" ] && exit 1
+
+  # Set value from environment
+  local var="${!1}"
+
+  # If this is null, load from file
+  if [ -z "$var" ]; then
+
+    # Try to load filename as-is
+    if [ -e $1 ]; then
+      var="$(cat $1)"
+
+    # If that doesn't exist, try to load it under /usr/local/env/
+    elif [ -e /usr/local/env/$1 ]; then
+      var="$(cat /usr/local/env/$1)"
+
+    # Default value from second parameter if nothing else
+    else
+      var="$2"
+    fi
+
+  fi
+
+  # Send back value
+  echo "$var"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_host [--local]
+# hostname for primary node in swarm
+# ie: wordpress.abc.example.com
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_host() {
+
+  local host=""
+  
+  # Get host from app and swarm (based on docker context)
+  if [ -z "$host" ]; then
+    local app=$(get_app)
+    local swarm=$(get_swarm $@)
+    [ -z "$app" ] && exit 1 
+    [ -z "$swarm" ] && exit 1 
+    host="$app.$swarm"
+  fi
+
+  echo $host
+
+}
+
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_image [--tag]
+# ie: registry.digitalocean.com/devbens/wordpress:latest
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_image() {
+
+  local tag=""
+  if [[ "$@" == *"--tag"* ]] || [[ "$@" == *"-t"* ]]; then
+    tag=":$(get_env TAG "latest")"
+  fi
+
+  local registry=$(get_env DOCKER_REGISTRY)
+  local app=$(get_app)
+
+  echo $registry/${app}${tag}
+
+}
+
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_login [--local]
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_login() {
+
+  local app=$(get_app)
+  local host=$(get_host $@)
+  local admin_user=$(get_env ADMIN_USER "bn-$app")
+  local admin_password=$(get_env ADMIN_PASSWORD $(get_db_password))
+
+  [ -z "$app" ] && exit 1 
+  [ -z "$host" ] && exit 1 
+  [ -z "$admin_user" ] && exit 1 
+  [ -z "$admin_password" ] && exit 1 
+
+  echo URL: https://$host/admin
+  echo Username: $admin_user
+  echo Password: $admin_password
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_node
+# Primary node in swarm
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_node() {
+
+  get_swarm $@ | awk -F. '{print $1}'
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_nodes
+# List of nodes in swarm
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_nodes() {
+
+  docker node ls --format '{{lower .Hostname}}' | xargs
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_nodes_count
+# Count of nodes in swarm multiplied by argument
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_nodes_count() {
+
+  local multiplier=$1
+  [ -z "$multiplier" ] && multiplier=1
+  echo $(($multiplier * $(get_nodes | wc -w)))
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_remote
+# > root@$(get_swarm)
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_remote() {
+
+  local swarm=$(get_swarm $@)
+  [ -z "$swarm" ] && exit 1 
+
+  echo root@$swarm
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_remotes
+# list of remotes for ssh
+# ie: `root@abc.example.com`,`root@abc01.example.com`
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_remotes() {
+  
+  local domain=$(get_domain)
+  local remotes="" 
+
+  [ -z "$domain" ] && exit 1 
+
+  for node in $(get_nodes); do
+    remotes="$remotes root@$node.$domain"
+  done
+
+  echo $remotes | xargs 
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_swarm [--local]
+# Swarm (abc.example.com) from current docker context or hostname
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_swarm() {
+
+  local swarm
+
+  # Show swarm for local environment
+  if [[ "$@" == *"--local"* ]] || [[ "$@" == *"-l"* ]]; then
+    swarm=$(hostname -f)
+
+  # Show swarm from current context
+  else
+    swarm=$(docker context inspect --format '{{lower .Endpoints.docker.Host}}' | awk -F@ '{print $2}')
+    [ -z "$swarm" ] && swarm=$(hostname -f)
+  fi
+
+  echo $swarm
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_tag [--local]
+# Generate next tag for this image
+# Finds the most recent v1 tag (or whatever number) and adds 1
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_tag() {
+
+  local last
+  local next
+
+  # Get last version tag from local image
+  if [[ "$@" == *"--local"* ]] || [[ "$@" == *"-l"* ]]; then
+    last=$(get_tags --version --local | awk '{print $1}')
+
+  # Get last version tag from registry image
+  else
+    last=$(get_tags --version | awk '{print $1}')
+  fi
+
+  # Add one and return it
+  next=$(echo $last | tr -d v | awk '{print $0+1}' )
+  echo "v$next"
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_tags --version --local 
+# List of tags available for this image
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_tags() {
+  
+  local app=$(get_app)
+  [ -z "$app" ] && exit 1
+
+  local registry=$(get_env DOCKER_REGISTRY)
+  [ -z "$registry" ] && exit 1
+
+  local tags
+
+  # Get tags from local image
+  if [[ "$@" == *"--local"* ]] || [[ "$@" == *"-l"* ]]; then
+    tags="$(docker image ls $registry/$app --format '{{ .Tag }}' | sed 's/<none>//g' | sort -V -r)"
+
+  # Get tags from registry image
+  else
+    tags="$(doctl registry repository list-tags --no-header --format 'Tag' $app 2> /dev/null | sort -V -r)"
+  fi
+
+  # Limit to only version tags (v1, v2, v3, etc)
+  if [[ "$@" == *"--version"* ]] || [[ "$@" == *"-v"* ]]; then
+    tags="$(echo "$tags" | awk '/^v[0-9]+/ { print $1 }')"
+  fi
+
+  echo "$tags" | xargs
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_trusted_ips
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_trusted_ips() {
+
+  if [ ! -z "$TRUSTED_IPS" ]; then
+    echo $TRUSTED_IPS | xargs
+
+  else
+
+    local floating_ips; floating_ips=$(doctl compute floating-ip list --no-header --format 'IP,Region' | awk "/$(get_env REGION)/ { print \$1 }" | xargs)
+    local node_ips; node_ips=$(doctl compute droplet list --no-header --format 'PublicIPv4,Tags' | awk '/swarm:/ { print $1 }' | xargs)
+    local ips="127.0.0.1 "
+
+    [ ! -z "$floating_ips" ] && ips="${ips}$floating_ips "
+    [ ! -z "$node_ips" ] && ips="${ips}$node_ips "
+
+    if [[ "$@" == *"--cidr"* ]] || [[ "$@" == *"-c"* ]]; then
+      ips=$(echo ${ips// /\/32 })
+    fi
+
+    echo $ips | xargs
+  fi
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_uploads
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_uploads() {
+
+  local domain=$(get_domain)
+  local app=$(get_app)
+
+  [ -z "$domain" ] && exit 1
+  [ -z "$app" ] && exit 1
+
+  # Ensure host directory exists
+  local uploads_dir="/data/$app/uploads"
+
+  # Get remote for this context's primary node
+  local remote=$(get_remote)
+
+  # If working with itself, skip ssh
+  if [ "$(get_remote --local)" = "$remote" ]; then
+    mkdir -p $uploads_dir >/dev/null 2>&1
+
+  # Otherwise, run mkdir with ssh
+  else
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $remote \
+      "mkdir -p $uploads_dir" >/dev/null 2>&1
+  fi
+
+  # Return path to uploads directory
+  echo $uploads_dir
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_host_user
+# Try to load HOST_USER from .env or environment, otherwise use get_app
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_host_user() {
+
+  if [ -z "$HOST_USER" ]; then
+    HOST_USER="$(get_env HOST_USER)"
+    if [ -z "$HOST_USER" ]; then
+      HOST_USER="$(get_app)"
+    fi
+  fi
+
+  echo $HOST_USER
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_host_password
+# Try to load HOST_PASSWORD from .env or environment, otherwise use get_app
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_host_password() {
+
+  if [ -z "$HOST_PASSWORD" ]; then
+    HOST_PASSWORD=$(get_env HOST_PASSWORD)
+    if [ -z "$HOST_PASSWORD" ]; then
+      HOST_PASSWORD=$(get_app)
+    fi
+  fi
+
+  echo $HOST_PASSWORD
+
+}
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# get_dump
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+get_dump() {
+
+  local domain=$(get_domain)
+  local app=$(get_app)
+
+  [ -z "$domain" ] && exit 1
+  [ -z "$app" ] && exit 1
+
+  # Ensure host directory exists
+  local dump_path="/data/$app/dump.sql"
+
+  # Get remote for this context's primary node
+  local remote=$(get_remote)
+
+  # If working with itself, skip ssh
+  if [ "$(get_remote --local)" = "$remote" ]; then
+    touch $dump_path >/dev/null 2>&1
+
+  # Otherwise, run touch with ssh
+  else
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $remote \
+      "touch $dump_path" >/dev/null 2>&1
+  fi
+
+  # Return path to uploads directory
+  echo $dump_path
+
+}
+
+
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# CLI
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+KEY=$1
+ARGS=${@:2}
+
+[ -z "$CMD_NAME" ] && CMD_NAME="get"
+
+case $KEY in
+
+  help | "")
+    echo
+    echo "Usage: $COMMAND_NAME KEY [ARGS]"
+    echo
+    echo "  app"
+    echo "  basic_auth [USERNAME] [PASSWORD]"
+    echo "  container_id [SERVICE]"
+    echo "  context [--role]"
+    echo "  contexts"
+    echo "  csv"
+    echo "  db_host"
+    echo "  db_name [--local]"
+    echo "  db_password"
+    echo "  db_user"
+    echo "  domain"
+    echo "  env [NAME]"
+    echo "  help"
+    echo "  host [--local]"
+    echo "  host_password"
+    echo "  host_user"
+    echo "  image [TAG]"
+    echo "  login"
+    echo "  node [--local]"
+    echo "  nodes"
+    echo "  nodes_count [MULTIPLIER]"
+    echo "  remote [--local]"
+    echo "  remotes"
+    echo "  shell [SERVICE] [COMMAND]"
+    echo "  swarm [--local]"
+    echo "  tag"
+    echo "  tags [--local]"
+    echo "  trusted_ips [--cidr]"
+    echo "  uploads"
+    echo ;;
+
+  app)                get_app ;;
+  basic_auth)         get_basic_auth $ARGS;;
+  container_id)       get_container_id $ARGS ;;
+  context)            get_context $ARGS;;
+  contexts)           get_contexts $ARGS;;
+  csv)                get_csv $ARGS ;;
+  db_host)            get_db_host ;;
+  db_name)            get_db_name $ARGS ;;
+  db_password)        get_db_password ;;
+  db_user)            get_db_user ;;
+  domain)             get_domain ;;
+  dump)               get_dump ;;
+  env)                get_env $ARGS ;;
+  host)               get_host $ARGS ;;
+  host_password)      get_host_password ;;
+  host_user)          get_host_user ;;
+  image)              get_image $ARGS ;;
+  login)              get_login $ARGS ;;
+  node)               get_node $ARGS ;;
+  nodes)              get_nodes ;;
+  nodes_count)        get_nodes_count $ARGS ;;
+  remote)             get_remote $ARGS ;;
+  remotes)            get_remotes ;;
+  shell)              get_shell $ARGS ;;
+  swarm)              get_swarm $ARGS ;;
+  tag)                get_tag $ARGS ;;
+  tags)               get_tags $ARGS ;;
+  trusted_ips)        get_trusted_ips $ARGS ;;
+  uploads)            get_uploads ;;
+
+  *)                  get_env $KEY $ARGS ;;
+
+esac
+exit

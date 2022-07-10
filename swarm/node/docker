@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# Source once locally if available OR via curl if not 
+include() {
+  [ -z "$1" ] && return 1
+  if [ -e /usr/local/share/bens/swarm/$1 ]; then source /usr/local/share/bens/swarm/$1;
+  elif [ -e /root/bens/swarm/$1 ]; then source /root/bens/swarm/$1;
+  else source <(curl -fsSL https://github.com/devbens/bens/raw/v2/swarm/$1); fi
+}
+
+# Bash helper functions
+include "lib/helpers.sh"
+
+
+# DRAIN DOCKER SWARM (run on manager)
+# ----------------------------------------
+if defined $DRAIN && defined $NODE; then
+
+  # Drain the node before reboot 
+  echo_run "docker node update --availability=drain ${NODE}"
+
+
+# ACTIVE DOCKER SWARM (run on manager)
+# ----------------------------------------
+elif defined $ACTIVE && defined $NODE; then
+
+  # Restore the node to active after reboot 
+  echo_run "docker node update --availability=active ${NODE}"
+
+
+# PROMOTE DOCKER SWARM (run on manager)
+# ----------------------------------------
+elif defined $PROMOTE && defined $NODE; then
+
+  # Run on primary node to promote a worker to manager
+  echo_run "docker node promote ${NODE}"
+  sleep 1
+
+
+# DEMOTE DOCKER SWARM (run on manager)
+# ----------------------------------------
+elif defined $DEMOTE && defined $NODE; then
+
+  # Run on primary node to demote manager (it's probably only a worker, but just in case)
+  echo_run "docker node demote ${NODE}"
+  sleep 5
+
+
+# DEMOTE DOCKER SWARM (run on worker)
+# ----------------------------------------
+elif defined $LEAVE; then
+
+  # Run on replica node to leave the swarm
+  echo_run "docker swarm leave"
+  sleep 5
+
+
+# DEMOTE DOCKER SWARM (run on manager)
+# ----------------------------------------
+elif defined $REMOVE && defined $NODE; then
+
+  # Run on primary node to remove worker node
+  echo_run "docker node rm --force ${NODE}"
+
+
+# JOIN/INIT DOCKER SWARM (run on each node)
+# ----------------------------------------
+elif defined $JOIN && defined $NODE && defined $JOIN_TOKEN && defined $PRIVATE_IP; then
+
+  # Primary node - create swarm
+  if [ "$JOIN_TOKEN" = "primary" ]; then
+
+    if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" != "active" ]; then
+      echo_next "Initializing swarm mode [${NODE}]"
+      echo "docker swarm init --advertise-addr $PRIVATE_IP"
+      docker swarm init --advertise-addr $PRIVATE_IP
+    else
+      echo_info "Swarm mode is already active for primary [${NODE}]"
+    fi
+
+    echo_next "Writing token to /usr/local/env/DOCKER_JOIN_TOKEN"
+    echo "$(docker swarm join-token worker | grep docker | awk '{print $5, $6}')" | tee /usr/local/env/DOCKER_JOIN_TOKEN
+
+  # Replica node - join swarm
+  else
+
+    if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" != "active" ]; then
+      echo_next "Joining swarm as worker [${NODE}]"
+      echo "docker swarm join --token $JOIN_TOKEN"
+      docker swarm join --token $JOIN_TOKEN
+    else
+      echo_info "Swarm mode is already active for replica [${NODE}]"
+    fi
+
+  fi
+
+fi

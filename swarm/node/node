@@ -1,0 +1,112 @@
+#!/bin/bash
+
+# Source once locally if available OR via curl if not 
+include() {
+  [ -z "$1" ] && return 1
+  if [ -e /usr/local/share/bens/swarm/$1 ]; then source /usr/local/share/bens/swarm/$1;
+  elif [ -e /root/bens/swarm/$1 ]; then source /root/bens/swarm/$1;
+  else source <(curl -fsSL https://github.com/devbens/bens/raw/v2/swarm/$1); fi
+}
+
+# Bash helper functions
+include "lib/helpers.sh"
+
+
+# Set from cloud-config, not changable:
+# SWARM NODE DOMAIN DROPLET_IMAGE FS_TYPE REGION
+set_env SWARMFILE_CONTENTS
+
+# These shouldn't change on an existing swarm
+set_env ROOT_PRIVATE_KEY
+set_env ROOT_PASSWORD
+
+# Update env variables with latest
+set_env DO_AUTH_TOKEN
+set_env DOCKER_REGISTRY
+set_env PRIMARY_IP
+
+# Used by traefik and others
+set_env BASICAUTH_PASSWORD
+set_env BASICAUTH_USER
+
+# Used by workspace
+set_env GITHUB_TOKEN
+set_env GITHUB_USER
+set_env GIT_USER_EMAIL
+set_env GIT_USER_NAME
+
+# VS Code password
+set_env CODE_PASSWORD
+
+# sudo for work user on workspace
+set_env SUDO_PASSWORD
+
+# Used by services on this swarm
+set_env DB_HOST
+set_env DB_PORT
+set_env DB_ROOT_USER
+set_env DB_ROOT_PASSWORD
+set_env SMTP_HOST
+set_env SMTP_PORT
+set_env SMTP_USER
+set_env SMTP_PASSWORD
+
+# dev/app/proxy
+set_env ROLE
+
+# Probably won't change, but can
+set_env WEBHOOK
+
+
+# Set root password
+if defined $ROOT_PASSWORD; then
+  echo_next "Setting password" 
+  for user in root work; do
+    echo "${user}:${ROOT_PASSWORD}"
+    echo "${user}:${ROOT_PASSWORD}" | chpasswd
+  done
+fi
+
+
+# Set root keys
+if defined $ROOT_PRIVATE_KEY; then
+  key="/root/.ssh/id_rsa"
+  echo_next "Writing ${key}"
+  echo "$ROOT_PRIVATE_KEY" | base64 -d > $key
+  chmod 400 $key
+  echo_next "Writing ${key}.pub"
+  echo "$(ssh-keygen -y -f $key) root@${NODE}" > $key.pub
+fi
+
+
+# Settings authorized_keys
+if defined $ROOT_PUBLIC_KEY; then
+  keys="$(curl -sL https://github.com/devbens/workspace/raw/main/config/ssh/authorized_keys)"
+  keys=$(echo -e "${ROOT_PUBLIC_KEY}\n${keys}")
+  echo_next "Writing /root/.ssh/authorized_keys"
+  echo "$keys" | tee /root/.ssh/authorized_keys
+  echo_run "cp -f /root/.ssh/authorized_keys /work/.ssh/authorized_keys"
+fi
+
+
+# Update /etc/hosts file
+if defined $HOSTS_FILE && defined $NODE; then
+  DOMAIN=$(cat /usr/local/env/DOMAIN)
+  echo_next "Setting /etc/hosts on $NODE"
+  hosts_self="127.0.1.1 ${NODE}.${DOMAIN} $NODE"
+  echo -e "${hosts_self}\n${HOSTS_FILE}" | tee /etc/hosts
+fi
+
+
+# Self-manage /etc/hosts file
+if undefined "$(cat /etc/cloud/cloud.cfg | grep manage_etc_hosts)"; then
+  echo_next "Appending /etc/cloud/cloud.cfg"
+  echo "manage_etc_hosts: False" | tee --append /etc/cloud/cloud.cfg
+fi
+
+
+# Ensure this node has access to our private images 
+if defined $DO_AUTH_TOKEN && defined $DOCKER_REGISTRY; then
+  echo_next "Logging into Docker Registry at Digital Ocean"
+  docker login -u $DO_AUTH_TOKEN -p $DO_AUTH_TOKEN $DOCKER_REGISTRY
+fi
